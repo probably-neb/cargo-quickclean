@@ -28,7 +28,6 @@ Options:
 struct Removal {
     path: PathBuf,
     display: PathBuf,
-    cleanup: Option<PathBuf>,
 }
 
 struct WorkState {
@@ -306,15 +305,6 @@ fn run(
                     }
                 }
             }
-            if !dry
-                && let Some(path) = &removal.cleanup
-                && let Err(error) = fs::remove_dir(path)
-            {
-                errors.push(format!(
-                    "cannot remove temporary directory {}: {error}",
-                    path.display()
-                ));
-            }
 
             let action = if errors.is_empty() {
                 if dry { "would clean" } else { "cleaned" }
@@ -464,22 +454,21 @@ fn run(
                 Removal {
                     display: target.clone(),
                     path: target,
-                    cleanup: None,
                 }
             } else {
                 let parent = target.parent().unwrap();
                 let stage = shared.next_stage.fetch_add(1, Ordering::Relaxed);
                 let mut attempt = 0;
-                let temporary_directory = loop {
+                let moved = loop {
                     let path = parent.join(format!(
                         ".cargo-quickclean-{}-{stage}-{attempt}",
                         shared.process_id
                     ));
-                    match fs::create_dir(&path) {
-                        Ok(()) => break path,
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => attempt += 1,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break path,
                         Err(error) => {
-                            errors.push(format!("cannot move {}: {error}", target.display()));
+                            errors.push(format!("cannot inspect {}: {error}", path.display()));
                             break 'target;
                         }
                     }
@@ -489,17 +478,14 @@ fn run(
                     .lock()
                     .unwrap()
                     .seen_targets
-                    .insert(temporary_directory.clone());
-                let moved = temporary_directory.join("target");
+                    .insert(moved.clone());
                 if let Err(error) = fs::rename(&target, &moved) {
-                    let _ = fs::remove_dir(&temporary_directory);
                     errors.push(format!("cannot move {}: {error}", target.display()));
                     break 'target;
                 }
                 Removal {
                     display: target,
                     path: moved,
-                    cleanup: Some(temporary_directory),
                 }
             };
 

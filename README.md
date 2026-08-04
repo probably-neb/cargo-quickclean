@@ -2,9 +2,9 @@
 
 `cargo-quickclean` removes Cargo `target` directories without waiting for an incremental tree deletion.
 
-Workers search and remove directories concurrently. When a worker finds a target, it creates a temporary directory beside the project. It atomically renames `target` into that directory, then adds the detached tree to the removal queue.
+Workers search and remove directories concurrently. When a worker finds a target, it atomically renames `target` to a temporary sibling path, then adds the detached tree to the removal queue.
 
-A sibling temporary directory keeps the rename on the same file system. The rename is atomic for each target, but a run across multiple targets is not one transaction.
+The sibling path keeps the rename on the same file system. The rename is atomic for each target, but a run across multiple targets is not one transaction.
 
 ## Install
 
