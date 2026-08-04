@@ -2,12 +2,20 @@ use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
+
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
 
 const HELP: &str = "Atomically detach and remove Cargo target directories
 
@@ -30,14 +38,23 @@ struct Removal {
     display: PathBuf,
 }
 
+#[derive(Clone)]
+struct RemovalStatus {
+    path: PathBuf,
+    bytes: u64,
+}
+
 struct WorkState {
     search: VecDeque<PathBuf>,
     removals: VecDeque<Removal>,
     seen_search: HashSet<PathBuf>,
     seen_targets: HashSet<PathBuf>,
     active_search: usize,
-    active_removals: usize,
+    active_removals: Vec<RemovalStatus>,
+    removed: Vec<RemovalStatus>,
+    errors: Vec<String>,
     total: usize,
+    complete: usize,
     failed: bool,
 }
 
@@ -157,8 +174,11 @@ fn main() {
             seen_search,
             seen_targets: HashSet::new(),
             active_search: 0,
-            active_removals: 0,
+            active_removals: Vec::new(),
+            removed: Vec::new(),
+            errors: Vec::new(),
             total: 0,
+            complete: 0,
             failed: false,
         }),
         wake: Condvar::new(),
@@ -168,33 +188,120 @@ fn main() {
     let lane_count = thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let reports = thread::scope(|scope| {
-        (0..lane_count)
-            .map(|_| scope.spawn(|| run(&shared, hidden, dry, no_size, &ignores)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|lane| lane.join().expect("cleanup lane panicked"))
-            .collect::<Vec<_>>()
+    let live = io::stdout().is_terminal();
+    let terminal_width = env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.parse::<usize>().ok())
+        .filter(|columns| *columns >= 40)
+        .map(|columns| columns - 1)
+        .unwrap_or(79);
+    thread::scope(|scope| {
+        let lanes = (0..lane_count)
+            .map(|_| scope.spawn(|| run(&shared, hidden, dry, no_size, live, &ignores)))
+            .collect::<Vec<_>>();
+        if live {
+            let mut rendered_lines = 0;
+            loop {
+                let finished = lanes.iter().all(|lane| lane.is_finished());
+                let (found, deleting, removed, errors, total, complete) = {
+                    let mut state = shared.state.lock().unwrap();
+                    (
+                        state
+                            .removals
+                            .iter()
+                            .map(|removal| removal.display.clone())
+                            .collect::<Vec<_>>(),
+                        state.active_removals.clone(),
+                        state.removed.clone(),
+                        std::mem::take(&mut state.errors),
+                        state.total,
+                        state.complete,
+                    )
+                };
+
+                let mut lines = Vec::new();
+                if !found.is_empty() {
+                    lines.push(format!("{CYAN}Found:{RESET}"));
+                    for path in &found {
+                        lines.push(format_status(path, None, terminal_width));
+                    }
+                }
+                if !removed.is_empty() {
+                    lines.push(format!("{GREEN}Removed:{RESET}"));
+                    for removal in &removed {
+                        let size = (!no_size).then(|| format_size(removal.bytes));
+                        lines.push(format_status(&removal.path, size, terminal_width));
+                    }
+                }
+                if !deleting.is_empty() {
+                    lines.push(format!("{YELLOW}Deleting:{RESET}"));
+                    for removal in &deleting {
+                        let size = (!no_size).then(|| format!("-{}", format_size(removal.bytes)));
+                        lines.push(format_status(&removal.path, size, terminal_width));
+                    }
+                }
+                let bytes = removed
+                    .iter()
+                    .chain(&deleting)
+                    .fold(0_u64, |total, removal| total.saturating_add(removal.bytes));
+                let action = if dry { "Measured" } else { "Deleted" };
+                let summary = if no_size {
+                    format!("{action} {complete}/{total} dirs")
+                } else {
+                    format!("{action} {complete}/{total} dirs -{}", format_size(bytes))
+                };
+                lines.push(format!("{BOLD}{summary}{RESET}"));
+
+                let mut output = io::stdout().lock();
+                if rendered_lines != 0 {
+                    let _ = write!(output, "\x1b[{rendered_lines}A");
+                    for _ in 0..rendered_lines {
+                        let _ = write!(output, "\r\x1b[2K\n");
+                    }
+                    let _ = write!(output, "\x1b[{rendered_lines}A");
+                    let _ = output.flush();
+                }
+                for error in errors {
+                    eprintln!("cargo quickclean: {error}");
+                }
+                for line in &lines {
+                    let _ = writeln!(output, "\r\x1b[2K{line}");
+                }
+                let _ = output.flush();
+                rendered_lines = lines.len();
+
+                if finished {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        for lane in lanes {
+            lane.join().expect("cleanup lane panicked");
+        }
     });
 
     let state = shared.state.into_inner().unwrap();
-    let bytes = reports
+    let bytes = state
+        .removed
         .iter()
-        .fold(0_u64, |total, report| total.saturating_add(report.0));
-    let complete = reports.iter().map(|report| report.1).sum::<usize>();
-    if state.total == 0 {
-        println!("No target directories found.");
-    } else {
-        let count = if complete == state.total {
-            format!("{} directories", state.total)
+        .fold(0_u64, |total, removal| total.saturating_add(removal.bytes));
+    let complete = state.complete;
+    if !live {
+        if state.total == 0 {
+            println!("No target directories found.");
         } else {
-            format!("{complete} of {} directories", state.total)
-        };
-        let action = if dry { "would remove" } else { "removed" };
-        if no_size {
-            println!("{action} {count}");
-        } else {
-            println!("{action} -{} from {count}", format_size(bytes));
+            let count = if complete == state.total {
+                format!("{} directories", state.total)
+            } else {
+                format!("{complete} of {} directories", state.total)
+            };
+            let action = if dry { "would remove" } else { "removed" };
+            if no_size {
+                println!("{action} {count}");
+            } else {
+                println!("{action} -{} from {count}", format_size(bytes));
+            }
         }
     }
 
@@ -203,25 +310,20 @@ fn main() {
     }
 }
 
-fn run(
-    shared: &Shared,
-    hidden: bool,
-    dry: bool,
-    no_size: bool,
-    ignores: &[PathBuf],
-) -> (u64, usize) {
-    let mut removed_bytes = 0_u64;
-    let mut complete = 0;
+fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, ignores: &[PathBuf]) {
     loop {
         let mut state = shared.state.lock().unwrap();
         while state.removals.is_empty()
             && state.search.is_empty()
-            && (state.active_search != 0 || state.active_removals != 0)
+            && (state.active_search != 0 || !state.active_removals.is_empty())
         {
             state = shared.wake.wait(state).unwrap();
         }
         if let Some(removal) = state.removals.pop_front() {
-            state.active_removals += 1;
+            state.active_removals.push(RemovalStatus {
+                path: removal.display.clone(),
+                bytes: 0,
+            });
             drop(state);
 
             enum Work {
@@ -234,6 +336,7 @@ fn run(
             }
 
             let mut bytes = 0_u64;
+            let mut published_bytes = 0_u64;
             let mut errors = Vec::new();
             let mut stack = vec![Work::Visit(removal.path.clone())];
             while let Some(work) = stack.pop() {
@@ -304,6 +407,18 @@ fn run(
                         }
                     }
                 }
+                if live && !no_size && bytes.saturating_sub(published_bytes) >= 1024 * 1024 {
+                    shared
+                        .state
+                        .lock()
+                        .unwrap()
+                        .active_removals
+                        .iter_mut()
+                        .find(|active| active.path == removal.display)
+                        .unwrap()
+                        .bytes = bytes;
+                    published_bytes = bytes;
+                }
             }
 
             let action = if errors.is_empty() {
@@ -311,24 +426,39 @@ fn run(
             } else {
                 "partially cleaned"
             };
-            if no_size {
-                println!("{action}: {}", removal.display.display());
-            } else {
-                println!(
-                    "{action} -{}: {}",
-                    format_size(bytes),
-                    removal.display.display()
-                );
-            }
-            for error in &errors {
-                eprintln!("cargo quickclean: {error}");
+            if !live {
+                if no_size {
+                    println!("{action}: {}", removal.display.display());
+                } else {
+                    println!(
+                        "{action} -{}: {}",
+                        format_size(bytes),
+                        removal.display.display()
+                    );
+                }
             }
 
-            removed_bytes = removed_bytes.saturating_add(bytes);
-            complete += usize::from(errors.is_empty());
+            let failed = !errors.is_empty();
             let mut state = shared.state.lock().unwrap();
-            state.failed |= !errors.is_empty();
-            state.active_removals -= 1;
+            if live {
+                state.errors.extend(errors);
+            } else {
+                for error in errors {
+                    eprintln!("cargo quickclean: {error}");
+                }
+            }
+            state.failed |= failed;
+            state.complete += usize::from(!failed);
+            let active = state
+                .active_removals
+                .iter()
+                .position(|active| active.path == removal.display)
+                .unwrap();
+            state.active_removals.remove(active);
+            state.removed.push(RemovalStatus {
+                path: removal.display,
+                bytes,
+            });
             drop(state);
             shared.wake.notify_all();
             continue;
@@ -435,21 +565,21 @@ fn run(
             let Some((target, stale)) = target else {
                 break 'target;
             };
-            if !shared
-                .state
-                .lock()
-                .unwrap()
-                .seen_targets
-                .insert(target.clone())
             {
-                break 'target;
+                let mut state = shared.state.lock().unwrap();
+                if !state.seen_targets.insert(target.clone()) {
+                    break 'target;
+                }
+                state.total += 1;
             }
 
-            println!(
-                "found{}: {}",
-                if stale { " stale" } else { "" },
-                target.display()
-            );
+            if !live {
+                println!(
+                    "found{}: {}",
+                    if stale { " stale" } else { "" },
+                    target.display()
+                );
+            }
             let removal = if stale || dry {
                 Removal {
                     display: target.clone(),
@@ -490,17 +620,21 @@ fn run(
             };
 
             let mut state = shared.state.lock().unwrap();
-            state.total += 1;
             state.removals.push_back(removal);
             drop(state);
             shared.wake.notify_one();
         }
 
-        for error in &errors {
-            eprintln!("cargo quickclean: {error}");
-        }
+        let failed = !errors.is_empty();
         let mut state = shared.state.lock().unwrap();
-        state.failed |= !errors.is_empty();
+        if live {
+            state.errors.extend(errors);
+        } else {
+            for error in errors {
+                eprintln!("cargo quickclean: {error}");
+            }
+        }
+        state.failed |= failed;
         for child in children {
             if state.seen_search.insert(child.clone()) {
                 state.search.push_back(child);
@@ -510,7 +644,6 @@ fn run(
         drop(state);
         shared.wake.notify_all();
     }
-    (removed_bytes, complete)
 }
 
 fn absolute_path(path: PathBuf, current_directory: &Path) -> PathBuf {
@@ -535,6 +668,26 @@ fn allocated_size(metadata: &fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn allocated_size(metadata: &fs::Metadata) -> u64 {
     metadata.len()
+}
+
+fn format_status(path: &Path, size: Option<String>, width: usize) -> String {
+    let size_width = size.as_ref().map_or(0, |size| size.chars().count() + 2);
+    let path_width = width.saturating_sub(size_width).max(1);
+    let path = path.display().to_string();
+    let length = path.chars().count();
+    let path = if length > path_width {
+        let suffix = path
+            .chars()
+            .skip(length - path_width.saturating_sub(1))
+            .collect::<String>();
+        format!("…{suffix}")
+    } else {
+        path
+    };
+    match size {
+        Some(size) => format!("{DIM}{path:<path_width$}{RESET}  {size}"),
+        None => format!("{DIM}{path}{RESET}"),
+    }
 }
 
 fn format_size(bytes: u64) -> String {

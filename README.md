@@ -41,6 +41,8 @@ Options:
 
 The recursive search does not enter symbolic-link directory entries. A directory is a Cargo project when it contains `Cargo.toml`. The tool removes the conventional `target` directory beside that file. It does not read Cargo configuration for another target location.
 
+Terminal output shows live lists of found, active, and removed targets followed by a summary. Redirected output uses one line per target.
+
 The removed size is the sum of allocated blocks from entries that the tool removed. On non-Unix systems, it uses file lengths. Hard links can make this value differ from the change in free disk space.
 
 If deletion stops after a rename, the temporary directory stays beside the project. Its name starts with `.cargo-quickclean-`. The next run finds and removes it.
