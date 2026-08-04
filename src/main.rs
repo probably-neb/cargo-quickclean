@@ -326,84 +326,43 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
             });
             drop(state);
 
-            enum Work {
-                Visit(PathBuf),
-                Directory {
-                    path: PathBuf,
-                    metadata: fs::Metadata,
-                    entries: fs::ReadDir,
-                },
-            }
-
             let mut bytes = 0_u64;
             let mut published_bytes = 0_u64;
             let mut errors = Vec::new();
-            let mut stack = vec![Work::Visit(removal.path.clone())];
-            while let Some(work) = stack.pop() {
-                match work {
-                    Work::Directory {
-                        path,
-                        metadata,
-                        mut entries,
-                    } => match entries.next() {
-                        Some(Ok(entry)) => {
-                            stack.push(Work::Directory {
-                                path,
-                                metadata,
-                                entries,
-                            });
-                            stack.push(Work::Visit(entry.path()));
-                        }
-                        Some(Err(error)) => {
-                            errors.push(format!(
-                                "cannot read an entry in {}: {error}",
-                                path.display()
-                            ));
-                            stack.push(Work::Directory {
-                                path,
-                                metadata,
-                                entries,
-                            });
-                        }
-                        None => {
-                            let result = if dry { Ok(()) } else { fs::remove_dir(&path) };
-                            match result {
-                                Ok(()) => {
-                                    bytes = bytes.saturating_add(allocated_size(&metadata));
-                                }
-                                Err(error) => errors
-                                    .push(format!("cannot remove {}: {error}", path.display())),
-                            }
-                        }
-                    },
-                    Work::Visit(path) => {
-                        let metadata = match fs::symlink_metadata(&path) {
-                            Ok(metadata) => metadata,
-                            Err(error) => {
-                                errors.push(format!("cannot inspect {}: {error}", path.display()));
-                                continue;
-                            }
-                        };
-                        if metadata.is_dir() {
-                            match fs::read_dir(&path) {
-                                Ok(entries) => stack.push(Work::Directory {
-                                    path,
-                                    metadata,
-                                    entries,
-                                }),
-                                Err(error) => {
-                                    errors.push(format!("cannot read {}: {error}", path.display()))
+            let mut pending = vec![removal.path.clone()];
+            let mut directories = Vec::new();
+            while let Some(path) = pending.pop() {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        errors.push(format!("cannot inspect {}: {error}", path.display()));
+                        continue;
+                    }
+                };
+                if metadata.is_dir() {
+                    match fs::read_dir(&path) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                match entry {
+                                    Ok(entry) => pending.push(entry.path()),
+                                    Err(error) => errors.push(format!(
+                                        "cannot read an entry in {}: {error}",
+                                        path.display()
+                                    )),
                                 }
                             }
-                            continue;
+                            directories.push((path, allocated_size(&metadata)));
                         }
-
-                        let result = if dry { Ok(()) } else { fs::remove_file(&path) };
-                        match result {
-                            Ok(()) => bytes = bytes.saturating_add(allocated_size(&metadata)),
-                            Err(error) => {
-                                errors.push(format!("cannot remove {}: {error}", path.display()))
-                            }
+                        Err(error) => {
+                            errors.push(format!("cannot read {}: {error}", path.display()))
+                        }
+                    }
+                } else {
+                    let result = if dry { Ok(()) } else { fs::remove_file(&path) };
+                    match result {
+                        Ok(()) => bytes = bytes.saturating_add(allocated_size(&metadata)),
+                        Err(error) => {
+                            errors.push(format!("cannot remove {}: {error}", path.display()))
                         }
                     }
                 }
@@ -418,6 +377,13 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                         .unwrap()
                         .bytes = bytes;
                     published_bytes = bytes;
+                }
+            }
+            for (path, directory_bytes) in directories.into_iter().rev() {
+                let result = if dry { Ok(()) } else { fs::remove_dir(&path) };
+                match result {
+                    Ok(()) => bytes = bytes.saturating_add(directory_bytes),
+                    Err(error) => errors.push(format!("cannot remove {}: {error}", path.display())),
                 }
             }
 
