@@ -552,6 +552,21 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                     path: target,
                 }
             } else {
+                let metadata = match fs::symlink_metadata(&target) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        errors.push(format!("cannot inspect {}: {error}", target.display()));
+                        break 'target;
+                    }
+                };
+                if metadata.is_dir() {
+                    let ignore = target.join(".gitignore");
+                    if let Err(error) = fs::write(&ignore, "*\n") {
+                        errors.push(format!("cannot write {}: {error}", ignore.display()));
+                        break 'target;
+                    }
+                }
+
                 let parent = target.parent().unwrap();
                 let stage = shared.next_stage.fetch_add(1, Ordering::Relaxed);
                 let mut attempt = 0;
