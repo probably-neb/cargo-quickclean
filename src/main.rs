@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -22,7 +22,7 @@ const HELP: &str = "Atomically detach and remove Cargo target directories
 Usage: cargo quickclean [OPTIONS] <PATHS>...
 
 Arguments:
-  <PATHS>...  Paths or globs to search for Cargo projects
+  <PATHS>...  Paths or quoted globs to search recursively for Cargo projects
 
 Options:
   -H, --hidden           Search hidden directories
@@ -31,7 +31,15 @@ Options:
   -s, --no-size          Do not print removed sizes
   -h, --help             Print help
   -V, --version          Print version
+
+Quote globs to expand them here instead of in the shell: cargo quickclean '*'
 ";
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Search {
+    path: PathBuf,
+    states: Vec<usize>,
+}
 
 struct Removal {
     path: PathBuf,
@@ -45,9 +53,9 @@ struct RemovalStatus {
 }
 
 struct WorkState {
-    search: VecDeque<PathBuf>,
+    search: VecDeque<Search>,
     removals: VecDeque<Removal>,
-    seen_search: HashSet<PathBuf>,
+    seen_search: HashSet<Search>,
     seen_targets: HashSet<PathBuf>,
     active_search: usize,
     active_removals: Vec<RemovalStatus>,
@@ -59,6 +67,8 @@ struct WorkState {
 }
 
 struct Shared {
+    // Component sequences end with an empty component; index 0 means discovery.
+    patterns: Vec<Vec<u8>>,
     state: Mutex<WorkState>,
     wake: Condvar,
     next_stage: AtomicUsize,
@@ -154,20 +164,81 @@ fn main() {
         .into_iter()
         .map(|path| absolute_path(path, &current_directory))
         .collect::<Vec<_>>();
-    let mut search = VecDeque::new();
-    let mut seen_search = HashSet::new();
+    let mut patterns = vec![Vec::new()];
+    let mut roots = HashMap::<PathBuf, Vec<usize>>::new();
     for path in paths {
         let path = absolute_path(path, &current_directory);
-        if !path.exists() {
+        let mut root = PathBuf::new();
+        let mut pattern = Vec::new();
+        for component in path.components() {
+            let value = component.as_os_str();
+            let bytes = value.as_encoded_bytes();
+            if pattern.is_empty()
+                && !bytes.iter().any(|byte| matches!(byte, b'*' | b'?' | b'{' | b'}'))
+            {
+                root.push(value);
+                continue;
+            }
+            if !pattern.is_empty() {
+                pattern.push(b'/');
+            }
+            pattern.extend_from_slice(bytes);
+        }
+        if !root.exists() {
             eprintln!("cargo quickclean: {} does not exist", path.display());
             process::exit(1);
         }
-        if seen_search.insert(path.clone()) {
-            search.push_back(path);
+        let mut pending = vec![pattern];
+        while let Some(pattern) = pending.pop() {
+            let Some(open) = pattern.iter().rposition(|byte| *byte == b'{') else {
+                if pattern.contains(&b'}') {
+                    eprintln!("cargo quickclean: invalid braces in {}", path.display());
+                    process::exit(1);
+                }
+                let mut components = pattern
+                    .split(|byte| *byte == b'/')
+                    .filter(|component| !component.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect::<Vec<_>>();
+                while components.last().is_some_and(|component| component == b"**") {
+                    components.pop();
+                }
+                components.dedup_by(|a, b| a.as_slice() == b"**" && b.as_slice() == b"**");
+                let states = roots.entry(root.clone()).or_default();
+                if components.is_empty() {
+                    states.clear();
+                    states.push(0);
+                } else if states.first() != Some(&0) {
+                    states.push(patterns.len());
+                    patterns.extend(components);
+                    patterns.push(Vec::new());
+                }
+                continue;
+            };
+            let close = pattern[open..]
+                .iter()
+                .position(|byte| *byte == b'}')
+                .map(|i| open + i);
+            let Some(close) = close.filter(|&close| pattern[open + 1..close].contains(&b',')) else {
+                eprintln!("cargo quickclean: invalid braces in {}", path.display());
+                process::exit(1);
+            };
+            for option in pattern[open + 1..close].split(|byte| *byte == b',') {
+                let mut alternative = pattern[..open].to_vec();
+                alternative.extend_from_slice(option);
+                alternative.extend_from_slice(&pattern[close + 1..]);
+                pending.push(alternative);
+            }
         }
     }
+    let search = roots
+        .into_iter()
+        .map(|(path, states)| Search { path, states })
+        .collect::<VecDeque<_>>();
+    let seen_search = search.iter().cloned().collect();
 
     let shared = Shared {
+        patterns,
         state: Mutex::new(WorkState {
             search,
             removals: VecDeque::new(),
@@ -429,7 +500,7 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
             shared.wake.notify_all();
             continue;
         }
-        let Some(path) = state.search.pop_front() else {
+        let Some(Search { path, states }) = state.search.pop_front() else {
             break;
         };
         state.active_search += 1;
@@ -438,6 +509,7 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
         let mut children = Vec::new();
         let mut errors = Vec::new();
         let mut target = None;
+        let discovery = states == [0];
 
         'search: {
             if ignores.iter().any(|ignore| path.starts_with(ignore)) {
@@ -454,7 +526,7 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                 break 'search;
             }
             if metadata.is_file() {
-                if path.file_name() == Some(OsStr::new("Cargo.toml")) {
+                if discovery && path.file_name() == Some(OsStr::new("Cargo.toml")) {
                     let candidate = path.parent().unwrap_or(Path::new(".")).join("target");
                     if fs::symlink_metadata(&candidate).is_ok_and(|metadata| {
                         metadata.is_dir() || metadata.file_type().is_symlink()
@@ -467,26 +539,29 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
             if !metadata.is_dir() {
                 break 'search;
             }
-            if is_stale(&path) {
-                target = Some((path.clone(), true));
-                break 'search;
-            }
-            if path.file_name() == Some(OsStr::new("target"))
-                && path
-                    .parent()
-                    .is_some_and(|parent| parent.join("Cargo.toml").is_file())
-            {
-                target = Some((path.clone(), false));
-                break 'search;
-            }
-
             let is_project = path.join("Cargo.toml").is_file();
-            if is_project {
-                let candidate = path.join("target");
-                if fs::symlink_metadata(&candidate)
-                    .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
+            if discovery {
+                let stale = is_stale(&path);
+                let is_target = stale
+                    || (path.file_name() == Some(OsStr::new("target"))
+                        && path
+                            .parent()
+                            .is_some_and(|parent| parent.join("Cargo.toml").is_file()));
+                let candidate = if is_target {
+                    path.clone()
+                } else {
+                    path.join("target")
+                };
+                if is_target
+                    || (is_project
+                        && fs::symlink_metadata(&candidate).is_ok_and(|metadata| {
+                            metadata.is_dir() || metadata.file_type().is_symlink()
+                        }))
                 {
-                    target = Some((candidate, false));
+                    target = Some((candidate, stale));
+                }
+                if is_target {
+                    break 'search;
                 }
             }
 
@@ -510,20 +585,56 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                 };
                 let name = entry.file_name();
                 let entry_path = entry.path();
-                if (name == "target" && is_project)
-                    || (!hidden
-                        && name.to_string_lossy().starts_with('.')
-                        && !is_stale(&entry_path))
-                {
+                if discovery && name == "target" && is_project {
                     continue;
                 }
-                match entry.file_type() {
-                    Ok(file_type) if file_type.is_dir() => children.push(entry_path),
-                    Ok(_) => {}
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
                     Err(error) => {
-                        errors.push(format!("cannot inspect {}: {error}", entry_path.display()))
+                        errors.push(format!("cannot inspect {}: {error}", entry_path.display()));
+                        continue;
                     }
+                };
+                if !file_type.is_dir() {
+                    continue;
                 }
+                let hidden_name = !hidden && name.as_encoded_bytes().starts_with(b".");
+                let stale = is_stale(&entry_path);
+                let mut child_states = Vec::new();
+                for &state in &states {
+                    let recursive = shared.patterns[state] == b"**";
+                    let next = state + usize::from(recursive);
+                    let value = &shared.patterns[next];
+                    if recursive
+                        && !hidden_name
+                        && !stale
+                        && !(name == "target" && is_project)
+                    {
+                        child_states.push(state);
+                    }
+                    if hidden_name && !value.starts_with(b".") && !(discovery && stale) {
+                        continue;
+                    }
+                    if !value.is_empty() && !matches_name(value, name.as_encoded_bytes()) {
+                        continue;
+                    }
+                    if value.is_empty() || shared.patterns[next + 1].is_empty() {
+                        // Discovery subsumes every other match in this subtree.
+                        child_states.clear();
+                        child_states.push(0);
+                        break;
+                    }
+                    child_states.push(next + 1);
+                }
+                if child_states.is_empty() {
+                    continue;
+                }
+                child_states.sort_unstable();
+                child_states.dedup();
+                children.push(Search {
+                    path: entry_path,
+                    states: child_states,
+                });
             }
         }
 
@@ -638,11 +749,44 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
 }
 
 fn absolute_path(path: PathBuf, current_directory: &Path) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix("~") {
+        let Some(home) = env::var_os("HOME") else {
+            eprintln!("cargo quickclean: cannot expand ~: HOME is not set");
+            process::exit(1);
+        };
+        return PathBuf::from(home).join(relative);
+    }
     if path.is_absolute() {
         path
     } else {
         current_directory.join(path)
     }
+}
+
+fn matches_name(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut pattern_index, mut name_index) = (0, 0);
+    let mut star = None;
+    while name_index < name.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some((pattern_index, name_index));
+            pattern_index += 1;
+        } else if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == name[name_index])
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if let Some((retry_pattern, retry_name)) = star {
+            star = Some((retry_pattern, retry_name + 1));
+            pattern_index = retry_pattern + 1;
+            name_index = retry_name + 1;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 fn is_stale(path: &Path) -> bool {
