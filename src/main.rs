@@ -546,12 +546,10 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                     target.display()
                 );
             }
-            let removal = if stale || dry {
-                Removal {
-                    display: target.clone(),
-                    path: target,
+            let path = 'detach: {
+                if stale || dry {
+                    break 'detach target.clone();
                 }
-            } else {
                 let metadata = match fs::symlink_metadata(&target) {
                     Ok(metadata) => metadata,
                     Err(error) => {
@@ -562,6 +560,12 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                 if metadata.is_dir() {
                     let ignore = target.join(".gitignore");
                     if let Err(error) = fs::write(&ignore, "*\n") {
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+                        ) {
+                            break 'detach target.clone();
+                        }
                         errors.push(format!("cannot write {}: {error}", ignore.display()));
                         break 'target;
                     }
@@ -591,17 +595,23 @@ fn run(shared: &Shared, hidden: bool, dry: bool, no_size: bool, live: bool, igno
                     .seen_targets
                     .insert(moved.clone());
                 if let Err(error) = fs::rename(&target, &moved) {
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+                    ) {
+                        break 'detach target.clone();
+                    }
                     errors.push(format!("cannot move {}: {error}", target.display()));
                     break 'target;
                 }
-                Removal {
-                    display: target,
-                    path: moved,
-                }
+                moved
             };
 
             let mut state = shared.state.lock().unwrap();
-            state.removals.push_back(removal);
+            state.removals.push_back(Removal {
+                display: target,
+                path,
+            });
             drop(state);
             shared.wake.notify_one();
         }
